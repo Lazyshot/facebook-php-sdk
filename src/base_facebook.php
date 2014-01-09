@@ -162,12 +162,12 @@ abstract class BaseFacebook
    * @var array
    */
   public static $DOMAIN_MAP = array(
-    'api'         => 'https://api.facebook.com/',
-    'api_video'   => 'https://api-video.facebook.com/',
-    'api_read'    => 'https://api-read.facebook.com/',
+    'api'         => 'http://api.facebook.com/',
+    'api_video'   => 'http://api-video.facebook.com/',
+    'api_read'    => 'http://api-read.facebook.com/',
     'graph'       => 'https://graph.facebook.com/',
-    'graph_video' => 'https://graph-video.facebook.com/',
-    'www'         => 'https://www.facebook.com/',
+    'graph_video' => 'http://graph-video.facebook.com/',
+    'www'         => 'http://www.facebook.com/',
   );
 
   /**
@@ -234,6 +234,11 @@ abstract class BaseFacebook
    */
   protected $allowSignedRequest = true;
 
+  protected $reactLoop;
+  protected $dnsResolverFactory;
+  protected $requestFactory;
+  protected $dnsResolver;
+
   /**
    * Initialize a Facebook Application.
    *
@@ -264,6 +269,10 @@ abstract class BaseFacebook
     if (!empty($state)) {
       $this->state = $state;
     }
+    $this->reactLoop = React\EventLoop\Factory::create();
+    $this->dnsResolverFactory = new React\Dns\Resolver\Factory();
+    $this->dnsResolver = $this->dnsResolverFactory->createCached('8.8.8.8', $this->reactLoop);
+    $this->requestFactory = new React\HttpClient\Factory();
   }
 
   /**
@@ -688,6 +697,10 @@ abstract class BaseFacebook
     }
   }
 
+  public function wait() {
+    $this->reactLoop->run();
+  }
+
   /**
    * Constructs and returns the name of the cookie that
    * potentially houses the signed request for the app user.
@@ -901,19 +914,20 @@ abstract class BaseFacebook
       $domainKey = 'graph';
     }
 
-    $result = json_decode($this->_oauthRequest(
+    $result = $this->_oauthRequest(
       $this->getUrl($domainKey, $path),
       $params
-    ), true);
+    );
 
     // results are returned, errors are thrown
-    if (is_array($result) && isset($result['error'])) {
-      $this->throwAPIException($result);
-      // @codeCoverageIgnoreStart
-    }
-    // @codeCoverageIgnoreEnd
-
-    return $result;
+    return $result->then(function($data){
+      $data = json_decode($data, true);
+      if (is_array($data) && isset($data['error'])) {
+        return new React\Promise\RejectedPromise($this->throwAPIException($data));
+      } else {
+        return new React\Promise\FulfilledPromise($data);
+      }
+    });
   }
 
   /**
@@ -969,73 +983,56 @@ abstract class BaseFacebook
    * @return string The response text
    */
   protected function makeRequest($url, $params, $ch=null) {
-    if (!$ch) {
-      $ch = curl_init();
-    }
+    $result = new React\Promise\Deferred();
 
-    $opts = self::$CURL_OPTS;
-    if ($this->getFileUploadSupport()) {
-      $opts[CURLOPT_POSTFIELDS] = $params;
-    } else {
-      $opts[CURLOPT_POSTFIELDS] = http_build_query($params, null, '&');
-    }
-    $opts[CURLOPT_URL] = $url;
+    $client = $this->requestFactory->create($this->reactLoop, $this->dnsResolver);
 
     // disable the 'Expect: 100-continue' behaviour. This causes CURL to wait
     // for 2 seconds if the server does not support this header.
-    if (isset($opts[CURLOPT_HTTPHEADER])) {
-      $existing_headers = $opts[CURLOPT_HTTPHEADER];
-      $existing_headers[] = 'Expect:';
-      $opts[CURLOPT_HTTPHEADER] = $existing_headers;
+    if ($this->getFileUploadSupport()) {
+      $data = $params;
     } else {
-      $opts[CURLOPT_HTTPHEADER] = array('Expect:');
+      $data = http_build_query($params, null, '&');
     }
 
-    curl_setopt_array($ch, $opts);
-    $result = curl_exec($ch);
-
-    $errno = curl_errno($ch);
-    // CURLE_SSL_CACERT || CURLE_SSL_CACERT_BADFILE
-    if ($errno == 60 || $errno == 77) {
-      self::errorLog('Invalid or no certificate authority found, '.
-                     'using bundled information');
-      curl_setopt($ch, CURLOPT_CAINFO,
-                  dirname(__FILE__) . DIRECTORY_SEPARATOR . 'fb_ca_chain_bundle.crt');
-      $result = curl_exec($ch);
+    if (!empty($headers)) {
+      unset($headers['Expect']);
+    } else {
+      $headers = array();
     }
 
-    // With dual stacked DNS responses, it's possible for a server to
-    // have IPv6 enabled but not have IPv6 connectivity.  If this is
-    // the case, curl will try IPv4 first and if that fails, then it will
-    // fall back to IPv6 and the error EHOSTUNREACH is returned by the
-    // operating system.
-    if ($result === false && empty($opts[CURLOPT_IPRESOLVE])) {
-        $matches = array();
-        $regex = '/Failed to connect to ([^:].*): Network is unreachable/';
-        if (preg_match($regex, curl_error($ch), $matches)) {
-          if (strlen(@inet_pton($matches[1])) === 16) {
-            self::errorLog('Invalid IPv6 configuration on server, '.
-                           'Please disable or get native IPv6 on your server.');
-            self::$CURL_OPTS[CURLOPT_IPRESOLVE] = CURL_IPRESOLVE_V4;
-            curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
-            $result = curl_exec($ch);
-          }
+    $headers['Content-length'] = strlen($data);
+
+    $request = $client->request('POST', $url, $headers);
+
+    $request->on('response', function($response) use (&$result){
+      $buffer = '';
+
+      $response->on('data', function($data) use (&$buffer) {
+        $buffer .= $data;
+      });
+
+      $response->on('end', function() use (&$buffer, &$result) {
+        if (!empty($buffer)) {
+          $result->resolve($buffer);
+        } else {
+          $result->reject(
+            new FacebookApiException(array(
+              'error' => array(
+                'message' => 'Empty response received',
+                'type' => 'GraphException',
+              ),
+            ))
+          );
         }
-    }
+      });
+    });
 
-    if ($result === false) {
-      $e = new FacebookApiException(array(
-        'error_code' => curl_errno($ch),
-        'error' => array(
-        'message' => curl_error($ch),
-        'type' => 'CurlException',
-        ),
-      ));
-      curl_close($ch);
-      throw $e;
-    }
-    curl_close($ch);
-    return $result;
+    $request->writeHead();
+
+    $request->end($data);
+
+    return $result->promise();
   }
 
   /**
@@ -1347,7 +1344,7 @@ abstract class BaseFacebook
         break;
     }
 
-    throw $e;
+    return $e;
   }
 
 
